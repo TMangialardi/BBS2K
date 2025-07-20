@@ -32,12 +32,11 @@ namespace BBS2K.Network
             _logger.Information($"{logPrefix} Reading STUN settings from configuration.");
 
             var stunSettings = _configuration.GetSection("StunSettings").Get<StunSettings>();
-            if(stunSettings == null || string.IsNullOrEmpty(stunSettings.BaseUrl))
+            if(stunSettings == null || string.IsNullOrEmpty(stunSettings.BaseUrl) || !stunSettings.Port.HasValue || !stunSettings.TimeOut.HasValue)
             {
                 _logger.Error($"{logPrefix} Missing STUN settings in configuration.");
                 throw new Exception("Missing STUN settings in configuration.");
             }
-
 
             _logger.Information($"{logPrefix} Finding the IP associated to the STUN server: {stunSettings.BaseUrl}.");
 
@@ -47,11 +46,11 @@ namespace BBS2K.Network
                 _logger.Error($"{logPrefix} Could not find STUN server's IP.");
                 throw new Exception("Could not find STUN server's IP.");
             }
-            var stunEndpoint = new IPEndPoint(ip.First(), stunSettings.Port);
+            var stunEndpoint = new IPEndPoint(ip.First(), stunSettings.Port.Value);
 
             _logger.Information($"{logPrefix} IP associated to the STUN server found: {stunEndpoint.Address}.");
 
-            STUNClient.ReceiveTimeout = stunSettings.TimeOut;
+            STUNClient.ReceiveTimeout = stunSettings.TimeOut.Value;
 
             _logger.Information($"{logPrefix} Contacting the STUN server.");
 
@@ -63,7 +62,7 @@ namespace BBS2K.Network
                 throw new Exception("Query Error: " + queryResult.QueryError.ToString());
             }
 
-            _logger.Information($"{logPrefix} Public IP found: {queryResult.PublicEndPoint.ToString().Split(':').First()}.");
+            _logger.Information($"{logPrefix} Public IP found: {queryResult.PublicEndPoint}.");
             return queryResult.PublicEndPoint;
         }
     }

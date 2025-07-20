@@ -1,141 +1,242 @@
-﻿using Serilog;
-using System;
-using System.Collections.Generic;
-using System.Linq;
+﻿using BBS2K.Models;
+using Newtonsoft.Json;
+using Serilog;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text;
-using System.Threading.Tasks;
 
 namespace BBS2K.Network
 {
     public class Peer
     {
-        private readonly TcpListener _listener;
-        private readonly List<TcpClient> _connectedPeers;
+        private readonly string _username;
         private readonly int _port;
         private readonly ILogger _logger;
-        private bool _isRunning;
+        private readonly UdpClient _udpClient;
 
-        public event Action<string>? MessageReceived;
-        public event Action<string>? PeerDisconnected;
+        private readonly ConcurrentDictionary<string, IPEndPoint> _peers;
+        private CancellationTokenSource _cancellationTokenSource;
 
-        public Peer(int port, ILogger logger)
+        public Peer(string username, int port, ILogger logger)
         {
+            _username = username;
             _port = port;
             _logger = logger;
-            _listener = new(IPAddress.Any, _port);
-            _connectedPeers = [];
+            _udpClient = new UdpClient(_port);
+            _peers = new();
+            _cancellationTokenSource = new();
         }
 
-        public async Task StartListening()
+        public async Task StartAsync(IPEndPoint? initialPeer)
         {
-            _isRunning = true;
-            _listener.Start();
+            _logger.Information("[StartAsync@Peer] Starting peer.");
 
-            await Task.Run(async () =>
+            await Task.Run(ListenForMessagesAsync, _cancellationTokenSource.Token);
+
+            if (initialPeer != null)
             {
-                while (_isRunning)
-                {
-                    try
-                    {
-                        var client =  await _listener.AcceptTcpClientAsync();
-                        lock (_connectedPeers)
-                        {
-                            _connectedPeers.Add(client);
-
-                        }
-                        await HandlePeer(client);
-                    }
-                    catch(Exception ex)
-                    {
-                        Console.WriteLine(ex);      //TODO: MIGLIORARE
-                    }
-                }
-            });            
+                _logger.Information("[StartAsync@Peer] initial peer available. Adding it to the peers list.");
+                await AddPeerAsync(initialPeer).ConfigureAwait(false);
+                await SendPeerRequestAsync(initialPeer);
+            }
         }
 
-        private async Task HandlePeer(TcpClient tcpClient)
+        private async Task ListenForMessagesAsync()
         {
-            ArgumentNullException.ThrowIfNull(tcpClient);
-
-            using var stream = tcpClient.GetStream();
-            byte[] buffer = new byte[4096];
-
             try
             {
-                while (_isRunning)      //TODO: VERIFICARE IL COMPORTAMENTO
+                while (!_cancellationTokenSource.Token.IsCancellationRequested)
                 {
-                    int bytesRead = await stream.ReadAsync(buffer);
-                    if (bytesRead == 0) break;
+                    IPEndPoint remoteEndpoint = new(IPAddress.Any, 0);
+                    var receivedMessage = _udpClient.Receive(ref remoteEndpoint);
 
-                    string message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                    MessageReceived?.Invoke(AesEncryption.Decrypt(message));
+                    var decryptedMessage = string.Empty;
+
+                    try
+                    {
+                        decryptedMessage = AesEncryption.Decrypt(Encoding.UTF8.GetString(receivedMessage));
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error($"[ListenForMessagesAsync@Peer] Received a malformed message from peer {remoteEndpoint}: {ex.Message}.");
+                        Console.WriteLine($"Received a malformed message from peer {remoteEndpoint}.");
+                        continue;
+                    }
+                    var message = new P2PMessage();
+                    try
+                    {
+                        message = JsonConvert.DeserializeObject<P2PMessage>(decryptedMessage);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error($"[ListenForMessagesAsync@Peer] Error deserializing message from peer {remoteEndpoint}: {ex.Message}.");
+                        Console.WriteLine($"Error deserializing message from peer {remoteEndpoint}.");
+                        continue;
+                    }
+
+                    if (string.IsNullOrEmpty(message?.Sender))
+                    {
+                        continue;
+                    }
+
+                    await AddPeerAsync(remoteEndpoint).ConfigureAwait(false);
+
+                    _logger.Information($"[ListenForMessagesAsync@Peer] Received a {message.MessageType} message from peer {message.Sender}@{remoteEndpoint}.");
+
+                    switch (message?.MessageType)
+                    {
+                        case MessageType.Chat:
+                            Console.WriteLine($"[{message.Sender}@{remoteEndpoint}] {message.Content}");
+                            break;
+                        case MessageType.PeerRequest:
+                            Console.WriteLine($"{message.Sender}@{remoteEndpoint} requested the peer list.");
+
+                            var peersList = _peers.Keys.ToList();
+                            var response = new P2PMessage()
+                            {
+                                MessageType = MessageType.PeerResponse,
+                                Sender = _username,
+                                Content = JsonConvert.SerializeObject(peersList)
+                            };
+
+                            await SendMessageAsync(response, remoteEndpoint);
+                            break;
+                        case MessageType.PeerResponse:
+                            var discoveredPeers = JsonConvert.DeserializeObject<string[]>(message.Content ?? "[]");
+
+                            if (discoveredPeers != null)
+                            {
+                                Console.WriteLine($"Received peer list with {discoveredPeers.Length} addresses from {remoteEndpoint}.");
+                                foreach (var peerAddr in discoveredPeers)
+                                {
+                                    if (IPEndPoint.TryParse(peerAddr, out var newPeerEp))
+                                    {
+                                        await AddPeerAsync(newPeerEp).ConfigureAwait(false);
+                                    }
+                                }
+                            }
+
+                            break;
+                    }
                 }
-                
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
+            {
+                _logger.Error($"[ListenForMessagesAsync@Peer] Listener stopped.");
+                Console.WriteLine("Listener stopped.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine(ex);      //TODO: MIGLIORARE
+                _logger.Error($"[ListenForMessagesAsync@Peer] Error in listener: {ex.Message}.");
+                Console.WriteLine($"Error in listener: {ex.Message}.");
             }
-            finally
-            {
-                lock (_connectedPeers)
-                {
-                    _connectedPeers.Remove(tcpClient);
-                }
-                tcpClient.Close();
-            }
+            
         }
 
-        public async Task BroadcastMessage(string message)
+        public async Task SendMessageAsync(P2PMessage message, IPEndPoint receiver)
         {
-            byte[] data = Encoding.UTF8.GetBytes(AesEncryption.Encrypt(message));
+            _logger.Information($"[SendMessageAsync@Peer] Sending message to {receiver}.");
 
-            foreach (var peer in _connectedPeers.ToArray())
+            if (string.IsNullOrEmpty(message.Sender))
+                message.Sender = _username;
+
+            var encryptedJsonMessage = AesEncryption.Encrypt(JsonConvert.SerializeObject(message));
+
+            var messageBytes = Encoding.UTF8.GetBytes(encryptedJsonMessage);
+
+            await _udpClient.SendAsync(messageBytes, messageBytes.Length, receiver);
+        }
+
+        public async Task BroadcastChatMessageAsync(string message)
+        {
+            var fullMessage = new P2PMessage()
+            {
+                Sender = _username,
+                Content = message,
+                MessageType = MessageType.Chat
+            };
+
+            var allPeers = _peers.Values.ToList();
+
+            _logger.Information($"[SendMessageAsync@Peer] Broadcasting message to {allPeers.Count} peers.");
+
+            foreach (var peerEndPoint in allPeers)
             {
                 try
                 {
-                    await peer.GetStream().WriteAsync(data);
-                }
-                catch
-                {
-                    lock (_connectedPeers)
-                    {
-                        _connectedPeers.Remove(peer);
-
-                    }
-                }
-            }  
-        }
-
-        public async Task ConnectToPeers(List<string> peers)
-        {
-            foreach (var peerIP in peers)
-            {
-                try
-                {
-                    var client = new TcpClient();
-                    await client.ConnectAsync(peerIP, _port);
-                    lock (_connectedPeers)
-                    {
-                        _connectedPeers.Add(client); //valutare se rimpiazzare connectedPeers con una concurrentBag
-                    }
-                    await HandlePeer(client);
+                    await SendMessageAsync(fullMessage, peerEndPoint);
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine(ex);      //TODO: MIGLIORARE
+                    _logger.Error($"[SendMessageAsync@Peer] Failed to send message to {peerEndPoint}: {ex.Message}.");
+                    Console.WriteLine($"Failed to send message to {peerEndPoint}: {ex.Message}.");
+                    // TODO: Gestire peer che non rispondono
                 }
             }
+        }
+
+        private async Task SendPeerRequestAsync(IPEndPoint destination)
+        {
+            _logger.Information($"[SendPeerRequestAsync@Peer] Sending peer request message to {destination}.");
+
+            var message = new P2PMessage()
+            {
+                MessageType = MessageType.PeerRequest,
+                Sender = _username,
+            };
+            await SendMessageAsync(message, destination);
+        }
+
+        private async Task AddPeerAsync(IPEndPoint peerEndPoint)
+        {
+            _logger.Information($"[AddPeer@Peer] Trying to add peer {peerEndPoint} to the list.");
+
+            if (peerEndPoint.Port == _port && (IPAddress.IsLoopback(peerEndPoint.Address) || peerEndPoint.Address.Equals((_udpClient.Client.LocalEndPoint as IPEndPoint)?.Address)))
+            {
+                _logger.Warning($"[AddPeer@Peer] Pear not added because its address corresponds to this peer's address.");
+                return;
+            }
+
+            if (_peers.TryAdd(peerEndPoint.ToString(), peerEndPoint))
+            {
+                _logger.Information($"[AddPeer@Peer] Correctly added {peerEndPoint} to the list.");
+
+                _logger.Information($"[AddPeer@Peer] Asking {peerEndPoint} its peer list.");
+
+                await SendPeerRequestAsync(peerEndPoint).ConfigureAwait(false);
+            }
+            else
+            {
+                _logger.Warning($"[AddPeer@Peer] The peer {peerEndPoint} was already in the list.");
+            }
+        }
+
+        public void PrintPeers()
+        {
+            _logger.Information($"[PrintPeers@Peer] Printing known peers.");
+
+            if (_peers.IsEmpty)
+            {
+                Console.WriteLine("No other peers known.");
+                return;
+            }
+
+            Console.WriteLine("--- Known Peers ---");
+            foreach (var peerAddress in _peers.Keys)
+            {
+                Console.WriteLine($"- {peerAddress}");
+            }
+            Console.WriteLine("-------------------\n\n");
         }
 
         public void Stop()
         {
-            _isRunning = false;
-            _listener?.Stop();
-            foreach (TcpClient peer in _connectedPeers)
-                peer.Close();
+            _logger.Information("[Stop@Peer] Stopping peer.");
+            _cancellationTokenSource.Cancel();
+            _udpClient.Close();
         }
     }
 }

@@ -2,9 +2,11 @@
 using BBS2K.Network;
 using Microsoft.Extensions.Configuration;
 using Serilog;
+using Serilog.Core;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -13,11 +15,17 @@ namespace BBS2K
     public class InitializationHelper
     {
         //Dynamic and private TCP/UDP ports range
-        public const int MIN_PORT = 49152;
-        public const int MAX_PORT = 65535;
+        public const int MIN_PORT = 10000;
+        public const int MAX_PORT = 20000;
+        private const string GREETING = "Commands:\n\n/exit to leave\n/peers to see known peers\n/myaddress to see your address and share it\n/help to get this help message\n";
 
         private int chosenPort;
         private string chosenNickname;
+        private IPEndPoint stunData;
+        private IPEndPoint? initialPeer;
+        private Logger logger;
+
+
         public InitializationHelper()
         {
             chosenPort = 0;
@@ -32,37 +40,30 @@ namespace BBS2K
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
             .Build();
 
-            var logger = new LoggerConfiguration()
+            logger = new LoggerConfiguration()
                 .ReadFrom.Configuration(configuration)
                 .CreateLogger();
 
-            logger.Information($"{logPrefix} Startup completed. Reading port from appsettings.");
+            logger.Information($"{logPrefix} Startup completed. Reading port from AppSettings.");
 
             var defaultSettings = configuration.GetSection("DefaultSettings").Get<DefaultSettings>();
 
             Console.WriteLine("Welcome to BBS2K!\n\n");
+            Console.WriteLine(GREETING);
 
             if (defaultSettings == null)
-                throw new Exception("Missing DefaultSettings section inside the AppSettings file.");
-
-            if (defaultSettings!.Port == null || defaultSettings!.Port.Value < MIN_PORT || defaultSettings.Port.Value > MAX_PORT)
             {
-                logger.Information($"{logPrefix} Port missing or not valid. Asking for a value.");
+                logger.Information($"{logPrefix} Missing DefaultSettings section inside the AppSettings file.");
+                throw new Exception("Missing DefaultSettings section inside the AppSettings file.");
+            }
 
-                var validPort = false;
-                Console.WriteLine("Insert a port:\n\n");
+            if (defaultSettings!.Port == null || defaultSettings!.Port.Value < MIN_PORT || defaultSettings.Port.Value >= MAX_PORT)
+            {
+                logger.Information($"{logPrefix} Port missing or not valid. Generating a value.");
 
-                while (!validPort)
-                {
-                    validPort = int.TryParse(Console.ReadLine(), out chosenPort);
-                    if (!validPort || chosenPort < MIN_PORT || chosenPort > MAX_PORT)
-                    {
-                        logger.Information($"{logPrefix} Port not valid. Asking again.");
-                        Console.WriteLine("Port not valid. Try again:\n\n");
-                        validPort = false;
-                    }
-                }
-                logger.Information($"{logPrefix} Port selected correctly. Port number: {chosenPort}.");
+                chosenPort = new Random().Next(MIN_PORT, MAX_PORT);
+
+                logger.Information($"{logPrefix} Port generated. Port number: {chosenPort}.");
                 defaultSettings!.Port = chosenPort;
             }
             else
@@ -94,8 +95,48 @@ namespace BBS2K
                 Console.WriteLine($"Your nickname is {defaultSettings.Nickname}\n\n");
             }
 
-            var stunHelper = new StunHelper(logger);
-            var stun = await stunHelper.GetPublicEndpointAsync();
+            logger.Information($"{logPrefix} Configuring initial peer.");
+
+            Console.WriteLine($"Enter the address of a known peer [e.g. 12.34.56.78:12345] to join a chat.\n" +
+                $"Press Enter to start a new chat.\n");
+            var validPeer = false;
+            while (!validPeer)
+            {
+                var initialPeerAddress = Console.ReadLine()?.Trim() ?? string.Empty;
+                if (string.IsNullOrEmpty(initialPeerAddress))
+                {
+                    validPeer = true;
+                }
+                else
+                {
+                    try
+                    {
+                        initialPeer = IPEndPoint.Parse(initialPeerAddress);
+                        validPeer = true;
+                    }
+                    catch (Exception e)
+                    {
+                        logger.Error($"{logPrefix} Invalid peer address format: {e.Message}. Asking to try again.");
+                        Console.WriteLine($"Invalid peer address format. Try again.\n\n");
+                    }
+                }
+            }
+
+
+            if(!(initialPeer == null))
+            {
+                Console.WriteLine($"Joining a chat via {initialPeer}...");
+            }
+            else
+            {
+                var stunHelper = new StunHelper(logger, configuration);
+                stunData = await stunHelper.GetPublicEndpointAsync();
+
+                logger.Information($"{logPrefix} STUN address: {stunData.Address}.");
+                Console.WriteLine($"Your public address is {stunData.Address}:{defaultSettings.Port}. Share it with your friends to let them connect.\n\n");
+            }
+
+            Console.WriteLine($"You are '{this.chosenNickname}'. Happy chatting!\n");
         }
 
         public int GetPort()
@@ -106,6 +147,26 @@ namespace BBS2K
         public string GetNickname()
         {
             return this.chosenNickname;
+        }
+
+        public static string GetGreeting()
+        {
+            return GREETING;
+        }
+
+        public IPEndPoint GetStunData()
+        {
+            return stunData;
+        }
+
+        public ILogger GetLogger()
+        {
+            return this.logger;
+        }
+
+        public IPEndPoint? GetInitialPeer()
+        {
+            return this.initialPeer;
         }
     }
 }

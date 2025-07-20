@@ -9,34 +9,50 @@ namespace BBS2K
 {
     public static class AesEncryption
     {
-        private static readonly byte[] Key = Encoding.UTF8.GetBytes("XxyyQNwIl1CDD6cd");
-        private static readonly byte[] IV = Encoding.UTF8.GetBytes("d0b2yx6LObEsiffO");
+        private const string AESKEY = "XxyyQNwIl1CDD6cd";
+        private static readonly byte[] _key;
 
+
+        static AesEncryption()
+        {
+            _key = SHA256.HashData(Encoding.UTF8.GetBytes(AESKEY));
+        }
         public static string Encrypt(string plainText)
         {
-            using Aes aes = Aes.Create();
-            aes.Key = Key;
-            aes.IV = IV;
+            using var aes = Aes.Create();
+            aes.Key = _key;
+            aes.GenerateIV();
+            var iv = aes.IV;
 
-            ICryptoTransform encryptor = aes.CreateEncryptor(aes.Key, aes.IV);
-            using MemoryStream ms = new();
-            using CryptoStream cs = new(ms, encryptor, CryptoStreamMode.Write);
-            byte[] plainBytes = Encoding.UTF8.GetBytes(plainText);
-            cs.Write(plainBytes, 0, plainBytes.Length);
-            cs.FlushFinalBlock();
+            using var encryptor = aes.CreateEncryptor(aes.Key, iv);
+            using var ms = new MemoryStream();
+            ms.Write(iv, 0, iv.Length);
+            using (var cs = new CryptoStream(ms, encryptor, CryptoStreamMode.Write))
+            using (var sw = new StreamWriter(cs))
+            {
+                sw.Write(plainText);
+            }
             return Convert.ToBase64String(ms.ToArray());
         }
 
         public static string Decrypt(string cipherText)
         {
-            using Aes aes = Aes.Create();
-            aes.Key = Key;
-            aes.IV = IV;
+            byte[] cipherTextBytes = Convert.FromBase64String(cipherText);
 
-            ICryptoTransform decryptor = aes.CreateDecryptor(aes.Key, aes.IV);
-            using MemoryStream ms = new(Convert.FromBase64String(cipherText));
-            using CryptoStream cs = new(ms, decryptor, CryptoStreamMode.Read);
-            using StreamReader sr = new(cs);
+            using var aes = Aes.Create();
+            aes.Key = _key;
+
+            byte[] iv = new byte[16];
+            Array.Copy(cipherTextBytes, 0, iv, 0, iv.Length);
+            aes.IV = iv;
+
+            using var decryptor = aes.CreateDecryptor(aes.Key, aes.IV);
+            using var ms = new MemoryStream();
+            ms.Write(cipherTextBytes, iv.Length, cipherTextBytes.Length - iv.Length);
+            ms.Position = 0;
+
+            using var cs = new CryptoStream(ms, decryptor, CryptoStreamMode.Read);
+            using var sr = new StreamReader(cs);
             return sr.ReadToEnd();
         }
     }

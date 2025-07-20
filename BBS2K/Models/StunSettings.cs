@@ -9,7 +9,7 @@ namespace BBS2K.Models
     public class StunSettings
     {
         public string BaseUrl { get; set; }
-        public int Port { get; set; }
-        public int TimeOut { get; set; }
+        public int? Port { get; set; }
+        public int? TimeOut { get; set; }
     }
 }
