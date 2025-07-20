@@ -34,7 +34,7 @@ namespace BBS2K.Network
         {
             _logger.Information("[StartAsync@Peer] Starting peer.");
 
-            await Task.Run(ListenForMessagesAsync, _cancellationTokenSource.Token);
+            _ = Task.Run(ListenForMessagesAsync, _cancellationTokenSource.Token);
 
             if (initialPeer != null)
             {
@@ -126,7 +126,7 @@ namespace BBS2K.Network
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
             {
                 _logger.Error($"[ListenForMessagesAsync@Peer] Listener stopped.");
-                Console.WriteLine("Listener stopped.");
+                Console.WriteLine("Bye!");
             }
             catch (Exception ex)
             {
