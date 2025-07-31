@@ -24,6 +24,7 @@ namespace BBS2K
         private IPEndPoint stunData;
         private IPEndPoint? initialPeer;
         private Logger logger;
+        private IPEndPoint localEndpoint;
 
 
         public InitializationHelper()
@@ -122,8 +123,7 @@ namespace BBS2K
                 }
             }
 
-
-            if(!(initialPeer == null))
+            if (!(initialPeer == null))
             {
                 Console.WriteLine($"Joining a chat via {initialPeer}...");
             }
@@ -131,7 +131,6 @@ namespace BBS2K
             {
                 var stunHelper = new StunHelper(logger, configuration);
                 stunData = await stunHelper.GetPublicEndpointAsync();
-
                 logger.Information($"{logPrefix} STUN address: {stunData.Address}.");
                 Console.WriteLine($"Your public address is {stunData.Address}:{defaultSettings.Port}. Share it with your friends to let them connect.\n\n");
             }
@@ -167,6 +166,11 @@ namespace BBS2K
         public IPEndPoint? GetInitialPeer()
         {
             return this.initialPeer;
+        }
+
+        public IPEndPoint GetLocalEndpoint()
+        {
+            return this.localEndpoint;
         }
     }
 }

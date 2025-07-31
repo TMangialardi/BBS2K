@@ -4,8 +4,6 @@ using Serilog;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.CompilerServices;
-using System.Security.Cryptography;
 using System.Text;
 
 namespace BBS2K.Network
@@ -39,8 +37,10 @@ namespace BBS2K.Network
             if (initialPeer != null)
             {
                 _logger.Information("[StartAsync@Peer] initial peer available. Adding it to the peers list.");
-                await AddPeerAsync(initialPeer).ConfigureAwait(false);
-                await SendPeerRequestAsync(initialPeer);
+                if (await AddPeerAsync(initialPeer).ConfigureAwait(false))
+                {
+                    await SendPeerRequestAsync(initialPeer).ConfigureAwait(false);
+                }
             }
         }
 
@@ -50,19 +50,19 @@ namespace BBS2K.Network
             {
                 while (!_cancellationTokenSource.Token.IsCancellationRequested)
                 {
-                    IPEndPoint remoteEndpoint = new(IPAddress.Any, 0);
-                    var receivedMessage = _udpClient.Receive(ref remoteEndpoint);
+                    var receivedMessage = await _udpClient.ReceiveAsync(_cancellationTokenSource.Token).ConfigureAwait(false);
+                    var sendingEndpoint = receivedMessage.RemoteEndPoint;
 
                     var decryptedMessage = string.Empty;
 
                     try
                     {
-                        decryptedMessage = AesEncryption.Decrypt(Encoding.UTF8.GetString(receivedMessage));
+                        decryptedMessage = AesEncryption.Decrypt(Encoding.UTF8.GetString(receivedMessage.Buffer));
                     }
                     catch (Exception ex)
                     {
-                        _logger.Error($"[ListenForMessagesAsync@Peer] Received a malformed message from peer {remoteEndpoint}: {ex.Message}.");
-                        Console.WriteLine($"Received a malformed message from peer {remoteEndpoint}.");
+                        _logger.Error($"[ListenForMessagesAsync@Peer] Received a malformed message from peer {sendingEndpoint}: {ex.Message}.");
+                        Console.WriteLine($"Received a malformed message from peer {sendingEndpoint}.");
                         continue;
                     }
                     var message = new P2PMessage();
@@ -72,8 +72,8 @@ namespace BBS2K.Network
                     }
                     catch (Exception ex)
                     {
-                        _logger.Error($"[ListenForMessagesAsync@Peer] Error deserializing message from peer {remoteEndpoint}: {ex.Message}.");
-                        Console.WriteLine($"Error deserializing message from peer {remoteEndpoint}.");
+                        _logger.Error($"[ListenForMessagesAsync@Peer] Error deserializing message from peer {sendingEndpoint}: {ex.Message}.");
+                        Console.WriteLine($"Error deserializing message from peer {sendingEndpoint}.");
                         continue;
                     }
 
@@ -82,17 +82,17 @@ namespace BBS2K.Network
                         continue;
                     }
 
-                    await AddPeerAsync(remoteEndpoint).ConfigureAwait(false);
+                    await AddPeerAsync(sendingEndpoint).ConfigureAwait(false);
 
-                    _logger.Information($"[ListenForMessagesAsync@Peer] Received a {message.MessageType} message from peer {message.Sender}@{remoteEndpoint}.");
+                    _logger.Information($"[ListenForMessagesAsync@Peer] Received a {message.MessageType} message from peer {message.Sender}@{sendingEndpoint}.");
 
                     switch (message?.MessageType)
                     {
                         case MessageType.Chat:
-                            Console.WriteLine($"[{message.Sender}@{remoteEndpoint}] {message.Content}");
+                            Console.WriteLine($"[{message.Sender}@{sendingEndpoint}] {message.Content}");
                             break;
                         case MessageType.PeerRequest:
-                            Console.WriteLine($"{message.Sender}@{remoteEndpoint} requested the peer list.");
+                            Console.WriteLine($"{message.Sender}@{sendingEndpoint} requested the peer list.");
 
                             var peersList = _peers.Keys.ToList();
                             var response = new P2PMessage()
@@ -102,19 +102,22 @@ namespace BBS2K.Network
                                 Content = JsonConvert.SerializeObject(peersList)
                             };
 
-                            await SendMessageAsync(response, remoteEndpoint);
+                            _ = SendMessageAsync(response, sendingEndpoint);
                             break;
                         case MessageType.PeerResponse:
                             var discoveredPeers = JsonConvert.DeserializeObject<string[]>(message.Content ?? "[]");
 
                             if (discoveredPeers != null)
                             {
-                                Console.WriteLine($"Received peer list with {discoveredPeers.Length} addresses from {remoteEndpoint}.");
+                                Console.WriteLine($"Received peer list with {discoveredPeers.Length} addresses from {sendingEndpoint}.");
                                 foreach (var peerAddr in discoveredPeers)
                                 {
                                     if (IPEndPoint.TryParse(peerAddr, out var newPeerEp))
                                     {
-                                        await AddPeerAsync(newPeerEp).ConfigureAwait(false);
+                                        if (await AddPeerAsync(newPeerEp).ConfigureAwait(false))
+                                        {
+                                            await SendPeerRequestAsync(newPeerEp).ConfigureAwait(false);
+                                        }
                                     }
                                 }
                             }
@@ -123,9 +126,14 @@ namespace BBS2K.Network
                     }
                 }
             }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
+            catch (OperationCanceledException)
             {
                 _logger.Error($"[ListenForMessagesAsync@Peer] Listener stopped.");
+                Console.WriteLine("Bye!");
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
+            {
+                _logger.Error($"[ListenForMessagesAsync@Peer] Listener stopped due to a socket interruption.");
                 Console.WriteLine("Bye!");
             }
             catch (Exception ex)
@@ -138,7 +146,7 @@ namespace BBS2K.Network
 
         public async Task SendMessageAsync(P2PMessage message, IPEndPoint receiver)
         {
-            _logger.Information($"[SendMessageAsync@Peer] Sending message to {receiver}.");
+            _logger.Information($"[SendMessageAsync@Peer] Sending message to {receiver}. Sender: {message.Sender}; Type: {message.MessageType}.");
 
             if (string.IsNullOrEmpty(message.Sender))
                 message.Sender = _username;
@@ -147,7 +155,9 @@ namespace BBS2K.Network
 
             var messageBytes = Encoding.UTF8.GetBytes(encryptedJsonMessage);
 
-            await _udpClient.SendAsync(messageBytes, messageBytes.Length, receiver);
+            var result = await _udpClient.SendAsync(messageBytes, messageBytes.Length, receiver);
+
+            _logger.Information($"[SendMessageAsync@Peer] Message sent to {receiver}. Output: {result}.");
         }
 
         public async Task BroadcastChatMessageAsync(string message)
@@ -190,27 +200,27 @@ namespace BBS2K.Network
             await SendMessageAsync(message, destination);
         }
 
-        private async Task AddPeerAsync(IPEndPoint peerEndPoint)
+        private async Task<bool> AddPeerAsync(IPEndPoint peerEndPoint)
         {
             _logger.Information($"[AddPeer@Peer] Trying to add peer {peerEndPoint} to the list.");
 
-            if (peerEndPoint.Port == _port && (IPAddress.IsLoopback(peerEndPoint.Address) || peerEndPoint.Address.Equals((_udpClient.Client.LocalEndPoint as IPEndPoint)?.Address)))
+            if (peerEndPoint.Port == _port && (IPAddress.IsLoopback(peerEndPoint.Address) ||
+                peerEndPoint.Address.Equals((_udpClient.Client.LocalEndPoint as IPEndPoint)?.Address) ||
+                Dns.GetHostEntry(Dns.GetHostName()).AddressList.Contains(peerEndPoint.Address)))
             {
                 _logger.Warning($"[AddPeer@Peer] Pear not added because its address corresponds to this peer's address.");
-                return;
+                return false;
             }
 
             if (_peers.TryAdd(peerEndPoint.ToString(), peerEndPoint))
             {
                 _logger.Information($"[AddPeer@Peer] Correctly added {peerEndPoint} to the list.");
-
-                _logger.Information($"[AddPeer@Peer] Asking {peerEndPoint} its peer list.");
-
-                await SendPeerRequestAsync(peerEndPoint).ConfigureAwait(false);
+                return true;
             }
             else
             {
                 _logger.Warning($"[AddPeer@Peer] The peer {peerEndPoint} was already in the list.");
+                return false;
             }
         }
 
@@ -220,7 +230,7 @@ namespace BBS2K.Network
 
             if (_peers.IsEmpty)
             {
-                Console.WriteLine("No other peers known.");
+                Console.WriteLine("No other peers known.\n\n");
                 return;
             }
 

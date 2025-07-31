@@ -47,6 +47,7 @@ class Program
                     peer.PrintPeers();
                     continue;
                 }
+                await peer.BroadcastChatMessageAsync(input);
 
             }
         }
