@@ -18,6 +18,9 @@ namespace BBS2K.Models
     {
         Chat,
         PeerRequest,
-        PeerResponse
+        PeerResponse,
+        Ping,
+        Pong,
+        Bye
     }
 }

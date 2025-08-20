@@ -10,13 +10,27 @@ namespace BBS2K.Network
 {
     public class Peer
     {
+        private class PeerState
+        {
+            public IPEndPoint EndPoint { get; }
+            public DateTime LastSeen { get; set; }
+            public PeerState(IPEndPoint endPoint)
+            {
+                EndPoint = endPoint;
+                LastSeen = DateTime.UtcNow;
+            }
+        }
+
         private readonly string _username;
         private readonly int _port;
         private readonly ILogger _logger;
         private readonly UdpClient _udpClient;
 
-        private readonly ConcurrentDictionary<string, IPEndPoint> _peers;
+        private readonly ConcurrentDictionary<string, PeerState> _peers;
         private CancellationTokenSource _cancellationTokenSource;
+
+        private static readonly TimeSpan HealthCheckInterval = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan PeerTimeout = TimeSpan.FromSeconds(100);
 
         public Peer(string username, int port, ILogger logger)
         {
@@ -33,6 +47,7 @@ namespace BBS2K.Network
             _logger.Information("[StartAsync@Peer] Starting peer.");
 
             _ = Task.Run(ListenForMessagesAsync, _cancellationTokenSource.Token);
+            _ = Task.Run(RunHealthChecksAsync, _cancellationTokenSource.Token);
 
             if (initialPeer != null)
             {
@@ -46,10 +61,11 @@ namespace BBS2K.Network
 
         private async Task ListenForMessagesAsync()
         {
-            try
+            while (!_cancellationTokenSource.Token.IsCancellationRequested)
             {
-                while (!_cancellationTokenSource.Token.IsCancellationRequested)
+                try
                 {
+
                     var receivedMessage = await _udpClient.ReceiveAsync(_cancellationTokenSource.Token).ConfigureAwait(false);
                     var sendingEndpoint = receivedMessage.RemoteEndPoint;
 
@@ -82,7 +98,7 @@ namespace BBS2K.Network
                         continue;
                     }
 
-                    await AddPeerAsync(sendingEndpoint).ConfigureAwait(false);
+                    UpdatePeerLiveness(sendingEndpoint);
 
                     _logger.Information($"[ListenForMessagesAsync@Peer] Received a {message.MessageType} message from peer {message.Sender}@{sendingEndpoint}.");
 
@@ -123,25 +139,42 @@ namespace BBS2K.Network
                             }
 
                             break;
+                        case MessageType.Ping:
+                            _logger.Information($"[ListenForMessagesAsync@Peer] Received a ping from {message.Sender}@{sendingEndpoint}. Sending pong.");
+                            var pongMessage = new P2PMessage()
+                            {
+                                MessageType = MessageType.Pong,
+                                Sender = _username
+                            };
+                            _ = SendMessageAsync(pongMessage, sendingEndpoint).ConfigureAwait(false);
+                            break;
+                        case MessageType.Pong:
+                            break;
+                        case MessageType.Bye:
+                            if (_peers.TryRemove(sendingEndpoint.ToString(), out _))
+                            {
+                                _logger.Debug($"[ListenForMessagesAsync@Peer] Received Bye message from {sendingEndpoint}.");
+                                Console.WriteLine($"Peer {sendingEndpoint} has disconnected.");
+                            }
+                            break;
                     }
                 }
+
+                catch (OperationCanceledException)
+                {
+                    _logger.Error($"[ListenForMessagesAsync@Peer] Listener stopped.");
+                    Console.WriteLine("Bye!");
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
+                {
+                    _logger.Error($"[ListenForMessagesAsync@Peer] Listener stopped due to a socket interruption.");
+                    Console.WriteLine("Bye!");
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error($"[ListenForMessagesAsync@Peer] Error in listener: {ex}.");
+                }
             }
-            catch (OperationCanceledException)
-            {
-                _logger.Error($"[ListenForMessagesAsync@Peer] Listener stopped.");
-                Console.WriteLine("Bye!");
-            }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
-            {
-                _logger.Error($"[ListenForMessagesAsync@Peer] Listener stopped due to a socket interruption.");
-                Console.WriteLine("Bye!");
-            }
-            catch (Exception ex)
-            {
-                _logger.Error($"[ListenForMessagesAsync@Peer] Error in listener: {ex.Message}.");
-                Console.WriteLine($"Error in listener: {ex.Message}.");
-            }
-            
         }
 
         public async Task SendMessageAsync(P2PMessage message, IPEndPoint receiver)
@@ -155,9 +188,9 @@ namespace BBS2K.Network
 
             var messageBytes = Encoding.UTF8.GetBytes(encryptedJsonMessage);
 
-            var result = await _udpClient.SendAsync(messageBytes, messageBytes.Length, receiver);
+            await _udpClient.SendAsync(messageBytes, messageBytes.Length, receiver);
 
-            _logger.Information($"[SendMessageAsync@Peer] Message sent to {receiver}. Output: {result}.");
+            _logger.Information($"[SendMessageAsync@Peer] Message sent to {receiver}.");
         }
 
         public async Task BroadcastChatMessageAsync(string message)
@@ -171,19 +204,23 @@ namespace BBS2K.Network
 
             var allPeers = _peers.Values.ToList();
 
-            _logger.Information($"[SendMessageAsync@Peer] Broadcasting message to {allPeers.Count} peers.");
+            _logger.Information($"[BroadcastChatMessageAsync@Peer] Broadcasting message to {allPeers.Count} peers.");
 
             foreach (var peerEndPoint in allPeers)
             {
                 try
                 {
-                    await SendMessageAsync(fullMessage, peerEndPoint);
+                    await SendMessageAsync(fullMessage, peerEndPoint.EndPoint);
+                }
+                catch(SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
+                {
+                    _logger.Error($"[BroadcastChatMessageAsync@Peer] Could not send message to {peerEndPoint.EndPoint}. The peer might be offline. Error: {ex.Message}.");
+                    Console.WriteLine($"Could not send message to {peerEndPoint.EndPoint}. The peer might be offline. Error: {ex.Message}.");
                 }
                 catch (Exception ex)
                 {
-                    _logger.Error($"[SendMessageAsync@Peer] Failed to send message to {peerEndPoint}: {ex.Message}.");
+                    _logger.Error($"[BroadcastChatMessageAsync@Peer] Failed to send message to {peerEndPoint}: {ex.Message}.");
                     Console.WriteLine($"Failed to send message to {peerEndPoint}: {ex.Message}.");
-                    // TODO: Gestire peer che non rispondono
                 }
             }
         }
@@ -202,24 +239,24 @@ namespace BBS2K.Network
 
         private async Task<bool> AddPeerAsync(IPEndPoint peerEndPoint)
         {
-            _logger.Information($"[AddPeer@Peer] Trying to add peer {peerEndPoint} to the list.");
+            _logger.Information($"[AddPeerAsync@Peer] Trying to add peer {peerEndPoint} to the list.");
 
             if (peerEndPoint.Port == _port && (IPAddress.IsLoopback(peerEndPoint.Address) ||
                 peerEndPoint.Address.Equals((_udpClient.Client.LocalEndPoint as IPEndPoint)?.Address) ||
                 Dns.GetHostEntry(Dns.GetHostName()).AddressList.Contains(peerEndPoint.Address)))
             {
-                _logger.Warning($"[AddPeer@Peer] Pear not added because its address corresponds to this peer's address.");
+                _logger.Warning($"[AddPeerAsync@Peer] Pear not added because its address corresponds to this peer's address.");
                 return false;
             }
 
-            if (_peers.TryAdd(peerEndPoint.ToString(), peerEndPoint))
+            if (_peers.TryAdd(peerEndPoint.ToString(), new PeerState(peerEndPoint)))
             {
-                _logger.Information($"[AddPeer@Peer] Correctly added {peerEndPoint} to the list.");
+                _logger.Information($"[AddPeerAsync@Peer] Correctly added {peerEndPoint} to the list.");
                 return true;
             }
             else
             {
-                _logger.Warning($"[AddPeer@Peer] The peer {peerEndPoint} was already in the list.");
+                _logger.Warning($"[AddPeerAsync@Peer] The peer {peerEndPoint} was already in the list.");
                 return false;
             }
         }
@@ -242,8 +279,75 @@ namespace BBS2K.Network
             Console.WriteLine("-------------------\n\n");
         }
 
-        public void Stop()
+        private async Task RunHealthChecksAsync()
         {
+            while (!_cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                await Task.Delay(HealthCheckInterval, _cancellationTokenSource.Token);
+
+                var allPeers = _peers.Values.ToList();
+                if (allPeers.Count == 0) continue;
+
+                var pingMessage = new P2PMessage()
+                {
+                    MessageType = MessageType.Ping,
+                    Sender = _username
+                };
+                foreach (var peerState in allPeers)
+                {
+                    await SendMessageAsync(pingMessage, peerState.EndPoint);
+                }
+
+                var now = DateTime.UtcNow;
+                var timedOutPeers = allPeers.Where(p => (now - p.LastSeen) > PeerTimeout).ToList();
+
+                foreach (var timedOutPeer in timedOutPeers)
+                {
+                    if (_peers.TryRemove(timedOutPeer.EndPoint.ToString(), out _))
+                    {
+                        _logger.Information($"[RunHealthChecksAsync@Peer] Peer {timedOutPeer.EndPoint} timed out and was removed.");
+                        Console.WriteLine($"Peer {timedOutPeer.EndPoint} timed out and was removed.");
+                    }
+                }
+            }
+        }
+
+        private void UpdatePeerLiveness(IPEndPoint peerEndPoint)
+        {
+            if (_peers.TryGetValue(peerEndPoint.ToString(), out var peerState))
+            {
+                _logger.Debug($"[UpdatePeerLiveness@Peer] Updating last seen time for peer {peerEndPoint}.");
+                peerState.LastSeen = DateTime.UtcNow;
+            }
+            else
+            {
+                _logger.Debug($"[UpdatePeerLiveness@Peer] Peer {peerEndPoint} not found in the list. Adding it.");
+                _ = AddPeerAsync(peerEndPoint);
+            }
+        }
+
+        public async Task StopAsync()
+        {         
+            _logger.Information("[StopAsync@Peer] Sending Bye message to all peers.");
+            var byeMessage = new P2PMessage()
+            {
+                MessageType = MessageType.Bye,
+                Sender = _username
+            };
+            var allPeers = _peers.Values.ToList();
+            foreach (var peerState in allPeers)
+            {
+                try
+                {
+                    _logger.Debug($"[StopAsync@Peer] Sending Bye message to {peerState.EndPoint}.");
+                    await SendMessageAsync(byeMessage, peerState.EndPoint);
+                }
+                catch
+                {
+                    _logger.Warning($"[StopAsync@Peer] Failed to send Bye message to {peerState.EndPoint}. It may have already disconnected.");
+                }
+            }
+
             _logger.Information("[Stop@Peer] Stopping peer.");
             _cancellationTokenSource.Cancel();
             _udpClient.Close();

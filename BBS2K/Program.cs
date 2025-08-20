@@ -1,12 +1,5 @@
 ﻿using BBS2K;
-using BBS2K.Models;
 using BBS2K.Network;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Configuration.Json;
-using Serilog;
-using System;
-using System.Security.Cryptography;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 class Program
 {
@@ -39,7 +32,7 @@ class Program
                 }
                 if (string.Equals(input, "/myaddress", StringComparison.InvariantCultureIgnoreCase))
                 {
-                    Console.WriteLine($"Your public address is {initialization.GetStunData().Address}:{initialization.GetPort()}. Share it with your friends to let them connect.\n\n");
+                    Console.WriteLine($"Your public address is {initialization.GetAddress()}:{initialization.GetPort()}. Share it with your friends to let them connect.\n\n");
                     continue;
                 }
                 if (string.Equals(input, "/peers", StringComparison.InvariantCultureIgnoreCase))
@@ -57,7 +50,7 @@ class Program
         }
         finally
         {
-            peer.Stop();
+            await peer.StopAsync();
             Console.WriteLine("You have been disconnected.\n\n");
         }        
     }

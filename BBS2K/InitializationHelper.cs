@@ -3,12 +3,8 @@ using BBS2K.Network;
 using Microsoft.Extensions.Configuration;
 using Serilog;
 using Serilog.Core;
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net;
-using System.Text;
-using System.Threading.Tasks;
+using System.Net.Sockets;
 
 namespace BBS2K
 {
@@ -18,28 +14,34 @@ namespace BBS2K
         public const int MIN_PORT = 10000;
         public const int MAX_PORT = 20000;
         private const string GREETING = "Commands:\n\n/exit to leave\n/peers to see known peers\n/myaddress to see your address and share it\n/help to get this help message\n";
+        public const string LOCAL_NETWORK_TYPE = "local";
+        public const string PRIVATE_NETWORK_TYPE = "private";
 
+        private IConfiguration configuration;
         private int chosenPort;
         private string chosenNickname;
         private IPEndPoint stunData;
         private IPEndPoint? initialPeer;
         private Logger logger;
         private IPEndPoint localEndpoint;
+        private DefaultSettings defaultSettings;
+        private string addressToPrint;
 
 
         public InitializationHelper()
         {
             chosenPort = 0;
             chosenNickname = string.Empty;
+            configuration = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .Build();
+            defaultSettings = configuration.GetSection("DefaultSettings").Get<DefaultSettings>();
         }
 
         public async Task Initialize()
         {
             var logPrefix = "[Initialize@InitializerHelper]";
-            IConfiguration configuration = new ConfigurationBuilder()
-            .SetBasePath(Directory.GetCurrentDirectory())
-            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-            .Build();
 
             logger = new LoggerConfiguration()
                 .ReadFrom.Configuration(configuration)
@@ -47,7 +49,6 @@ namespace BBS2K
 
             logger.Information($"{logPrefix} Startup completed. Reading port from AppSettings.");
 
-            var defaultSettings = configuration.GetSection("DefaultSettings").Get<DefaultSettings>();
 
             Console.WriteLine("Welcome to BBS2K!\n\n");
             Console.WriteLine(GREETING);
@@ -96,6 +97,24 @@ namespace BBS2K
                 Console.WriteLine($"Your nickname is {defaultSettings.Nickname}\n\n");
             }
 
+            var stunHelper = new StunHelper(logger, configuration);
+            stunData = await stunHelper.GetPublicEndpointAsync();
+            logger.Information($"{logPrefix} STUN address: {stunData.Address}.");
+            string localIP;
+            using (Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, 0))
+            {
+                socket.Connect("8.8.8.8", 65530);
+                IPEndPoint endPoint = socket.LocalEndPoint as IPEndPoint;
+                localIP = endPoint.Address.ToString();
+            }
+
+            this.addressToPrint = defaultSettings.NetworkType switch
+            {
+                LOCAL_NETWORK_TYPE => "127.0.0.1",  //localhost
+                PRIVATE_NETWORK_TYPE => localIP,
+                _ => stunData.Address.ToString()
+            };
+
             logger.Information($"{logPrefix} Configuring initial peer.");
 
             Console.WriteLine($"Enter the address of a known peer [e.g. 12.34.56.78:12345] to join a chat.\n" +
@@ -129,10 +148,8 @@ namespace BBS2K
             }
             else
             {
-                var stunHelper = new StunHelper(logger, configuration);
-                stunData = await stunHelper.GetPublicEndpointAsync();
-                logger.Information($"{logPrefix} STUN address: {stunData.Address}.");
-                Console.WriteLine($"Your public address is {stunData.Address}:{defaultSettings.Port}. Share it with your friends to let them connect.\n\n");
+                
+                Console.WriteLine($"Your public address is {addressToPrint}:{defaultSettings.Port}. Share it with your friends to let them connect.\n\n");
             }
 
             Console.WriteLine($"You are '{this.chosenNickname}'. Happy chatting!\n");
@@ -153,9 +170,9 @@ namespace BBS2K
             return GREETING;
         }
 
-        public IPEndPoint GetStunData()
+        public string GetAddress()
         {
-            return stunData;
+            return this.addressToPrint;
         }
 
         public ILogger GetLogger()
